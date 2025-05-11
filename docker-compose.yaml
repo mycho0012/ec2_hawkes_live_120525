@@ -1,0 +1,19 @@
+version: '3'
+
+services:
+  hawkes-trader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hawkes-trading-bot
+    restart: unless-stopped
+    ports:
+      - "8500:8500"
+    volumes:
+      - ./logs:/app/logs
+      - ./charts:/app/charts
+      - ./.env:/app/.env
+    environment:
+      - TZ=Asia/Seoul
+      - HOST_IP=3.82.149.232
+      - WEB_PORT=8500
