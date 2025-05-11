@@ -102,6 +102,71 @@ def get_trades_from_signal(data: pd.DataFrame, signal: np.array):
     short_trades = short_trades.set_index('entry_time')
     return long_trades, short_trades
 
+# 새로 추가된 안전한 버전의 vol_signal 함수
+def vol_signal_safe(close: pd.Series, vol_hawkes: pd.Series, lookback: int):
+    """인덱스 안정성이 보장된 호크스 신호 생성 함수"""
+    # 데이터 길이 확인 및 인덱스 일치 확인
+    if len(close) != len(vol_hawkes) or not close.index.equals(vol_hawkes.index):
+        print("vol_signal_safe: 입력 시리즈의 길이 또는 인덱스가 일치하지 않습니다.")
+        # 안전한 기본값 반환 (중립 신호)
+        return pd.Series(0, index=close.index)
+    
+    # 결과 시리즈 초기화 (인덱스 보존)
+    signal = pd.Series(0, index=close.index)
+    q05 = vol_hawkes.rolling(lookback).quantile(0.05)
+    q95 = vol_hawkes.rolling(lookback).quantile(0.95)
+    
+    # NaN 값 처리
+    q05 = q05.fillna(method='bfill').fillna(method='ffill')
+    q95 = q95.fillna(method='bfill').fillna(method='ffill')
+    
+    # 인덱스 안전성을 위해 데이터프레임 사용
+    df = pd.DataFrame({
+        'close': close,
+        'vol_hawkes': vol_hawkes,
+        'q05': q05,
+        'q95': q95,
+        'signal': signal
+    })
+    
+    # 마지막으로 5% 분위수 이하 값을 가진 인덱스 추적
+    last_below_idx = None
+    curr_sig = 0
+    
+    # 날짜 순서대로 처리하기 위해 인덱스 정렬
+    df = df.sort_index()
+    
+    # 각 행에 대해 신호 생성 로직 적용
+    for idx, row in df.iterrows():
+        # 5% 분위수 이하로 떨어진 경우
+        if row['vol_hawkes'] < row['q05']:
+            last_below_idx = idx
+            curr_sig = 0
+        
+        # 95% 분위수 위로 올라간 경우 (크로스오버)
+        if (row['vol_hawkes'] > row['q95'] and 
+            last_below_idx is not None):
+            
+            # 이전 인덱스 찾기 (안전하게)
+            try:
+                prev_idx = df.index[df.index.get_loc(idx) - 1]
+                if prev_idx in df.index and df.loc[prev_idx, 'vol_hawkes'] <= df.loc[prev_idx, 'q95']:
+                    # 이전 저점 대비 가격 변화 방향 확인
+                    if last_below_idx in df.index:
+                        change = row['close'] - df.loc[last_below_idx, 'close']
+                        if change > 0.0:
+                            curr_sig = 1
+                        else:
+                            curr_sig = -1
+            except (KeyError, IndexError) as e:
+                print(f"인덱스 처리 중 오류: {e}")
+                # 오류 발생 시 현재 신호 유지
+        
+        # 현재 신호 저장
+        df.at[idx, 'signal'] = curr_sig
+    
+    return df['signal']
+
 # 다음 코드 블록은 독립적인 테스트용이므로 주석 처리하여 실제 애플리케이션 실행에 영향을 주지 않도록 합니다
 '''
 data = pd.read_csv('BTCUSDT3600.csv')
