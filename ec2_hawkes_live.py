@@ -316,8 +316,23 @@ class EC2HawkesTrader:
     def update_data(self):
         """최신 데이터로 업데이트"""
         try:
-            # 새 캔들 가져오기
-            new_candle = pyupbit.get_ohlcv(TICKER, interval=CANDLE_INTERVAL, count=2)
+            # 새 캔들 가져오기 - 재시도 로직 추가
+            max_retries = 3
+            retry_count = 0
+            new_candle = None
+            
+            while retry_count < max_retries:
+                try:
+                    new_candle = pyupbit.get_ohlcv(TICKER, interval=CANDLE_INTERVAL, count=2)
+                    if new_candle is not None and not new_candle.empty:
+                        break
+                except Exception as retry_e:
+                    retry_count += 1
+                    logging.warning(f"OHLCV 데이터 가져오기 재시도 {retry_count}/{max_retries}: {str(retry_e)}")
+                    time.sleep(1)  # 1초 대기 후 재시도
+            
+            if new_candle is None or new_candle.empty:
+                raise Exception("캔들 데이터를 가져오지 못했습니다.")
             
             # 데이터 업데이트 방법 개선 - 안전하게 concat만 사용
             # 마지막 기존 캔들 시간
@@ -961,58 +976,115 @@ class EC2HawkesTrader:
         if chart_path:
             self.send_to_slack(f"📊 초기 호크스 차트가 생성되었습니다.")
         
+        # 마지막 성공적인 데이터 업데이트 시간 기록
+        last_successful_update = datetime.datetime.now()
+        
         try:
             while True:
-                # 데이터 업데이트
-                self.update_data()
-                
-                # 신호 확인
-                signal = self.check_signal()
-                
-                # 신호가 있으면 거래 실행
-                if signal is not None:
-                    self.execute_trade(signal)
-                    # 거래 후 계좌 정보 업데이트
-                    self.log_account_info()
+                try:
+                    # 루프 시작 시간 로깅 - 디버깅용
+                    loop_start_time = datetime.datetime.now()
+                    logging.info(f"루프 시작: {loop_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
                     
-                    # 거래 후 차트 생성 및 공유
-                    chart_path = self.create_and_share_chart()
-                    if chart_path:
-                        self.send_to_slack(f"📊 거래 후 호크스 차트가 업데이트되었습니다.")
-                
-                # 거래 기록 저장
-                if len(self.trade_history) % 5 == 0 and self.trade_history:
-                    self.save_trade_history()
-                
-                # 현재 시간 확인하여 다음 캔들 시작까지 대기
-                now = datetime.datetime.now()
-                next_hour = now.replace(minute=0, second=10) + datetime.timedelta(hours=1)
-                wait_seconds = (next_hour - now).total_seconds()
-                
-                # 대기 시간 정보 출력
-                wait_msg = f"다음 캔들까지 {wait_seconds:.0f}초 대기 중 ({next_hour.strftime('%Y-%m-%d %H:%M:%S')})"
-                logging.info(wait_msg)
-                self.send_to_slack(f"⏳ {wait_msg}")
-                
-                # 1시간마다 차트 업데이트
-                if now.minute < 5:  # 매 시간 처음 5분 이내에만 실행
-                    chart_path = self.create_and_share_chart()
-                    if chart_path:
-                        self.send_to_slack(f"📊 정기 호크스 차트가 업데이트되었습니다.")
-                
-                # 대기 (최대 1시간, 10분 간격으로 나누어 처리)
-                remaining_wait = wait_seconds
-                chunk_size = 600  # 10분 (초 단위)
-                
-                while remaining_wait > 0:
-                    sleep_time = min(chunk_size, remaining_wait)
-                    time.sleep(sleep_time)
-                    remaining_wait -= sleep_time
+                    # 데이터 업데이트
+                    self.update_data()
                     
-                    # 주기적으로 현재 상태 로깅 (30분마다)
-                    if remaining_wait % 1800 == 0 and remaining_wait > 0:
-                        self.send_to_slack(f"⏳ 아직 대기 중... {remaining_wait}초 남음")
+                    # 신호 확인
+                    signal = self.check_signal()
+                    
+                    # 신호가 있으면 거래 실행
+                    if signal is not None:
+                        self.execute_trade(signal)
+                        # 거래 후 계좌 정보 업데이트
+                        self.log_account_info()
+                        
+                        # 거래 후 차트 생성 및 공유
+                        chart_path = self.create_and_share_chart()
+                        if chart_path:
+                            self.send_to_slack(f"📊 거래 후 호크스 차트가 업데이트되었습니다.")
+                    
+                    # 거래 기록 저장
+                    if len(self.trade_history) % 5 == 0 and self.trade_history:
+                        self.save_trade_history()
+                    
+                    # 현재 시간 확인하여 다음 캔들 시작까지 대기
+                    now = datetime.datetime.now()
+                    next_hour = now.replace(minute=0, second=10) + datetime.timedelta(hours=1)
+                    
+                    # 이미 현재 시간이 'xx:00:10'을 지났다면 다음 시간으로 설정
+                    if next_hour <= now:
+                        next_hour = now.replace(minute=0, second=10) + datetime.timedelta(hours=2)
+                    
+                    wait_seconds = (next_hour - now).total_seconds()
+                    
+                    # 대기 시간이 음수일 경우, 즉시 다음 루프로 진행
+                    if wait_seconds <= 0:
+                        logging.warning(f"대기 시간이 음수입니다: {wait_seconds}초, 즉시 다음 루프로 진행합니다.")
+                        continue
+                    
+                    # 대기 시간 정보 출력
+                    wait_msg = f"다음 캔들까지 {wait_seconds:.0f}초 대기 중 ({next_hour.strftime('%Y-%m-%d %H:%M:%S')})"
+                    logging.info(wait_msg)
+                    self.send_to_slack(f"⏳ {wait_msg}")
+                    
+                    # 1시간마다 차트 업데이트
+                    if now.minute < 5:  # 매 시간 처음 5분 이내에만 실행
+                        chart_path = self.create_and_share_chart()
+                        if chart_path:
+                            self.send_to_slack(f"📊 정기 호크스 차트가 업데이트되었습니다.")
+                    
+                    # 성공적인 데이터 업데이트 시간 갱신
+                    last_successful_update = now
+                    
+                    # 대기 (최대 1시간, 5분 간격으로 나누어 처리)
+                    remaining_wait = wait_seconds
+                    chunk_size = 300  # 5분으로 변경 (초 단위)
+                    heartbeat_interval = 1800  # 30분마다 하트비트 메시지
+                    last_heartbeat = now
+                    
+                    # 더 작은 단위(1분)로 쪼개어 대기하면서 주기적으로 상태 확인
+                    small_chunk = 60  # 1분 단위로 세분화
+                    
+                    while remaining_wait > 0:
+                        current_chunk = min(small_chunk, remaining_wait)
+                        time.sleep(current_chunk)
+                        remaining_wait -= current_chunk
+                        
+                        current_time = datetime.datetime.now()
+                        
+                        # 30분마다 하트비트 메시지 출력
+                        if (current_time - last_heartbeat).total_seconds() >= heartbeat_interval:
+                            heartbeat_msg = f"⏳ 아직 대기 중... {remaining_wait:.0f}초 남음"
+                            logging.info(heartbeat_msg)
+                            self.send_to_slack(heartbeat_msg)
+                            last_heartbeat = current_time
+                        
+                        # 매 5분마다 연결 상태 확인
+                        if remaining_wait % chunk_size < small_chunk:
+                            # 간단한 API 호출로 연결 상태 확인
+                            try:
+                                current_price = pyupbit.get_current_price(TICKER)
+                                if current_price:
+                                    logging.info(f"연결 상태 확인: 정상 (BTC 현재가: {current_price:,.0f} KRW)")
+                            except Exception as conn_e:
+                                logging.warning(f"연결 상태 확인 오류: {str(conn_e)}")
                 
+                except Exception as loop_e:
+                    # 루프 내부의 예외 처리
+                    error_msg = f"루프 내부 오류 발생: {str(loop_e)}"
+                    logging.error(error_msg)
+                    self.send_to_slack(f"❌ {error_msg}")
+                    
+                    # 마지막 성공적인 업데이트 이후 너무 오래 지났다면(2시간 이상) 재시작 권장
+                    now = datetime.datetime.now()
+                    if (now - last_successful_update).total_seconds() > 7200:  # 2시간
+                        critical_error = "⚠️ 2시간 이상 정상 업데이트가 없습니다. 프로그램 재시작을 권장합니다."
+                        logging.critical(critical_error)
+                        self.send_to_slack(critical_error)
+                    
+                    # 10분 대기 후 다시 시도
+                    time.sleep(600)
+        
         except KeyboardInterrupt:
             stop_msg = "사용자에 의한 프로그램 종료"
             logging.info(stop_msg)
@@ -1023,13 +1095,22 @@ class EC2HawkesTrader:
             self.send_to_slack(f"❌ {error_msg}")
         finally:
             # 최종 잔고 로깅
-            self.log_account_info()
+            try:
+                self.log_account_info()
+            except:
+                logging.error("최종 잔고 로깅 실패")
             
             # 거래 기록 저장
-            self.save_trade_history()
+            try:
+                self.save_trade_history()
+            except:
+                logging.error("거래 기록 저장 실패")
             
             # 최종 차트 생성
-            self.create_and_share_chart()
+            try:
+                self.create_and_share_chart()
+            except:
+                logging.error("최종 차트 생성 실패")
             
             end_msg = "프로그램 종료"
             logging.info(end_msg)
