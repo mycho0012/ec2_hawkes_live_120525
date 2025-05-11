@@ -319,17 +319,24 @@ class EC2HawkesTrader:
             # 새 캔들 가져오기
             new_candle = pyupbit.get_ohlcv(TICKER, interval=CANDLE_INTERVAL, count=2)
             
-            # 이미 있는 마지막 캔들인지 확인
-            if self.trading_data.index[-1] == new_candle.index[-2]:
-                # 마지막 캔들 업데이트 - 안전하게 인덱스로 접근
-                self.trading_data.loc[new_candle.index[-2]] = new_candle.iloc[-2]
-                
-                # 새 캔들 추가
-                if new_candle.index[-1] not in self.trading_data.index:
-                    self.trading_data = pd.concat([self.trading_data, new_candle.iloc[[-1]]])
-            else:
-                # 새 캔들 추가 - concat을 사용하여 안전하게 추가
+            # 데이터 업데이트 방법 개선 - 안전하게 concat만 사용
+            # 마지막 기존 캔들 시간
+            last_candle_time = self.trading_data.index[-1]
+            
+            # 상황 1: 새 데이터의 첫 번째 캔들이 마지막 기존 캔들과 같을 때 (업데이트)
+            if last_candle_time in new_candle.index:
+                # 일치하는 시간의 행 삭제 후 새 데이터 추가
+                self.trading_data = self.trading_data.drop(last_candle_time)
                 self.trading_data = pd.concat([self.trading_data, new_candle])
+            else:
+                # 상황 2: 완전히 새로운 캔들만 있는 경우
+                self.trading_data = pd.concat([self.trading_data, new_candle])
+            
+            # 중복 인덱스 제거 (만약 있다면)
+            self.trading_data = self.trading_data[~self.trading_data.index.duplicated(keep='last')]
+            
+            # 인덱스 기준 정렬
+            self.trading_data = self.trading_data.sort_index()
             
             # 데이터가 너무 많아지면 오래된 데이터 삭제
             if len(self.trading_data) > LOOKBACK_HOURS:
