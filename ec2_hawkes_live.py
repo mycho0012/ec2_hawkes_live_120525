@@ -321,14 +321,14 @@ class EC2HawkesTrader:
             
             # 이미 있는 마지막 캔들인지 확인
             if self.trading_data.index[-1] == new_candle.index[-2]:
-                # 마지막 캔들 업데이트
-                self.trading_data.loc[self.trading_data.index[-1]] = new_candle.iloc[-2]
+                # 마지막 캔들 업데이트 - 안전하게 인덱스로 접근
+                self.trading_data.loc[new_candle.index[-2]] = new_candle.iloc[-2]
                 
                 # 새 캔들 추가
                 if new_candle.index[-1] not in self.trading_data.index:
                     self.trading_data = pd.concat([self.trading_data, new_candle.iloc[[-1]]])
             else:
-                # 새 캔들 추가
+                # 새 캔들 추가 - concat을 사용하여 안전하게 추가
                 self.trading_data = pd.concat([self.trading_data, new_candle])
             
             # 데이터가 너무 많아지면 오래된 데이터 삭제
