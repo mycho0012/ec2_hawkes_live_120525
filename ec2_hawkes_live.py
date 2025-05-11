@@ -601,7 +601,9 @@ class EC2HawkesTrader:
                     # 해당 매도 시점 바로 이전의 매수 찾기
                     prev_buys = buy_points[buy_points.index < idx]
                     if not prev_buys.empty:
-                        last_buy = prev_buys.iloc[-1]
+                        # 안전하게 마지막 매수 정보 가져오기
+                        last_buy_idx = prev_buys.index[-1]
+                        last_buy = prev_buys.loc[last_buy_idx]
                         entry_price = last_buy['close']
                         exit_price = sell_row['close']
                         profit_pct = (exit_price - entry_price) / entry_price * 100
