@@ -82,9 +82,20 @@ TICKER = "KRW-BTC"  # 비트코인
 CANDLE_INTERVAL = "minute60"  # 1시간 캔들
 LOOKBACK_HOURS = 2000  # 데이터 수집 기간 (500에서 2000으로 증가)
 
-# 파라미터 설정 (명령줄 인자로 전달 가능)
-KAPPA = args.kappa  # 호크스 프로세스 감쇠 계수
-VOLATILITY_LOOKBACK = args.lookback  # 변동성 기준 룩백 기간
+# 파라미터 설정 - 환경 변수 우선, 그 다음 명령줄 인자, 마지막으로 기본값
+# 환경 변수에서 KAPPA 값 가져오기 (없으면 명령줄 인자 사용)
+try:
+    env_kappa = os.getenv('KAPPA')
+    KAPPA = float(env_kappa) if env_kappa is not None else args.kappa
+except (ValueError, TypeError):
+    KAPPA = args.kappa  # 변환 오류 시 명령줄 인자 사용
+    
+# 환경 변수에서 VOLATILITY_LOOKBACK 값 가져오기 (없으면 명령줄 인자 사용)
+try:
+    env_lookback = os.getenv('VOLATILITY_LOOKBACK')
+    VOLATILITY_LOOKBACK = int(env_lookback) if env_lookback is not None else args.lookback
+except (ValueError, TypeError):
+    VOLATILITY_LOOKBACK = args.lookback  # 변환 오류 시 명령줄 인자 사용
 
 # 수수료
 COMMISSION_RATE = 0.0005  # 수수료율 (0.05%)
