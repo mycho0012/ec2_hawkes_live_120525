@@ -47,7 +47,7 @@ fix_pandas_ta()
 
 # 이제 안전하게 pandas_ta 임포트
 import pandas_ta as ta
-from hawkes import hawkes_process, vol_signal
+from hawkes import hawkes_process, vol_signal, vol_signal_safe
 
 # 로깅 설정
 logging.basicConfig(
@@ -135,6 +135,59 @@ class EC2HawkesTrader:
         
         # 초기 데이터 로드
         self.load_initial_data()
+    
+    def validate_trading_data(self, data, min_rows=10, required_columns=None):
+        """데이터프레임 유효성 검사 함수"""
+        if required_columns is None:
+            required_columns = ['open', 'high', 'low', 'close', 'volume']
+        
+        validation_errors = []
+        
+        # 1. 데이터프레임이 비어있는지 확인
+        if data is None or data.empty:
+            validation_errors.append("데이터프레임이 비어 있습니다.")
+            return False, validation_errors
+        
+        # 2. 최소 행 수 확인
+        if len(data) < min_rows:
+            validation_errors.append(f"데이터 행 수가 부족합니다. (현재: {len(data)}, 최소 필요: {min_rows})")
+        
+        # 3. 필수 열 존재 확인
+        missing_columns = [col for col in required_columns if col not in data.columns]
+        if missing_columns:
+            validation_errors.append(f"필수 열이 누락되었습니다: {missing_columns}")
+        
+        # 4. 중복 인덱스 확인
+        duplicate_indices = data.index.duplicated()
+        if duplicate_indices.any():
+            duplicate_count = duplicate_indices.sum()
+            validation_errors.append(f"중복된 인덱스가 있습니다: {duplicate_count}개")
+        
+        # 5. NaN 값 확인 (OHLC 데이터)
+        for col in ['open', 'high', 'low', 'close']:
+            if col in data.columns and data[col].isna().any():
+                nan_count = data[col].isna().sum()
+                validation_errors.append(f"'{col}' 열에 NaN 값이 있습니다: {nan_count}개")
+        
+        # 6. 시간 순서 확인
+        if not data.index.is_monotonic_increasing:
+            validation_errors.append("인덱스가 시간 순서대로 정렬되어 있지 않습니다.")
+        
+        # 7. OHLC 데이터 일관성 확인 (high >= low, high >= open, high >= close)
+        if {'high', 'low', 'open', 'close'}.issubset(set(data.columns)):
+            if (data['high'] < data['low']).any():
+                inconsistent_count = (data['high'] < data['low']).sum()
+                validation_errors.append(f"고가(high)가 저가(low)보다 낮은 행이 있습니다: {inconsistent_count}개")
+            
+            if (data['high'] < data['open']).any():
+                inconsistent_count = (data['high'] < data['open']).sum()
+                validation_errors.append(f"고가(high)가 시가(open)보다 낮은 행이 있습니다: {inconsistent_count}개")
+            
+            if (data['high'] < data['close']).any():
+                inconsistent_count = (data['high'] < data['close']).sum()
+                validation_errors.append(f"고가(high)가 종가(close)보다 낮은 행이 있습니다: {inconsistent_count}개")
+        
+        return len(validation_errors) == 0, validation_errors
         
     def start_http_server(self):
         """간단한 HTTP 서버 시작"""
@@ -198,6 +251,18 @@ class EC2HawkesTrader:
             
             # OHLCV 데이터 가져오기
             df = pyupbit.get_ohlcv(TICKER, interval=CANDLE_INTERVAL, count=LOOKBACK_HOURS)
+            
+            # 데이터 유효성 검사
+            is_valid, errors = self.validate_trading_data(df)
+            if not is_valid:
+                warning_msg = f"초기 데이터 유효성 검사 경고: {'; '.join(errors)}"
+                logging.warning(warning_msg)
+                self.send_to_slack(f"⚠️ {warning_msg}")
+            
+            # 중복 제거 및 정렬
+            df = df[~df.index.duplicated(keep='last')]
+            df = df.sort_index()
+            
             self.trading_data = df.copy()
             
             # 호크스 프로세스 적용 준비
@@ -284,97 +349,195 @@ class EC2HawkesTrader:
             self.send_to_slack(f"❌ {error_msg}")
             
     def prepare_hawkes_data(self):
-        """ATR 계산 및 호크스 프로세스 적용"""
-        # 정규화된 범위 계산
-        self.trading_data['log_high'] = np.log(self.trading_data['high'])
-        self.trading_data['log_low'] = np.log(self.trading_data['low'])
-        self.trading_data['log_close'] = np.log(self.trading_data['close'])
-        
-        # ATR 계산 (pandas_ta 사용)
-        norm_lookback = 336  # 14일 (시간 단위)
-        self.trading_data['atr'] = ta.atr(
-            self.trading_data['log_high'], 
-            self.trading_data['log_low'], 
-            self.trading_data['log_close'], 
-            norm_lookback
-        )
-        
-        # 정규화된 범위
-        self.trading_data['norm_range'] = (
-            self.trading_data['log_high'] - self.trading_data['log_low']
-        ) / self.trading_data['atr']
-        
-        # 호크스 프로세스 적용
-        self.trading_data['v_hawk'] = hawkes_process(self.trading_data['norm_range'], KAPPA)
-        
-        # 변동성 분위수 계산
-        self.trading_data['q05'] = self.trading_data['v_hawk'].rolling(VOLATILITY_LOOKBACK).quantile(0.05)
-        self.trading_data['q95'] = self.trading_data['v_hawk'].rolling(VOLATILITY_LOOKBACK).quantile(0.95)
-        
-        # 거래 신호 생성
-        self.trading_data['signal'] = vol_signal(
-            self.trading_data['close'], 
-            self.trading_data['v_hawk'], 
-            VOLATILITY_LOOKBACK
-        )
-        
-        # 롱 온리 전략 적용 (매도 신호 -1을 0으로 변환)
-        self.trading_data['signal'] = self.trading_data['signal'].apply(lambda x: 1 if x == 1 else 0)
-        
-        # 마지막 신호 저장
-        self.last_signal = self.trading_data['signal'].iloc[-1]
-        
-    def update_data(self):
-        """최신 데이터로 업데이트"""
+        """ATR 계산 및 호크스 프로세스 적용 - 안전한 버전"""
         try:
-            # 새 캔들 가져오기 - 재시도 로직 추가
+            # 정규화된 범위 계산
+            self.trading_data['log_high'] = np.log(self.trading_data['high'])
+            self.trading_data['log_low'] = np.log(self.trading_data['low'])
+            self.trading_data['log_close'] = np.log(self.trading_data['close'])
+            
+            # ATR 계산 (pandas_ta 사용)
+            norm_lookback = 336  # 14일 (시간 단위)
+            self.trading_data['atr'] = ta.atr(
+                high=self.trading_data['log_high'], 
+                low=self.trading_data['log_low'], 
+                close=self.trading_data['log_close'], 
+                length=norm_lookback
+            )
+            
+            # ATR NaN 처리
+            self.trading_data['atr'] = self.trading_data['atr'].fillna(method='bfill').fillna(method='ffill')
+            
+            # 정규화된 범위
+            self.trading_data['norm_range'] = (
+                self.trading_data['log_high'] - self.trading_data['log_low']
+            ) / self.trading_data['atr']
+            
+            # 호크스 프로세스 적용
+            self.trading_data['v_hawk'] = hawkes_process(self.trading_data['norm_range'], KAPPA)
+            
+            # 변동성 분위수 계산
+            self.trading_data['q05'] = self.trading_data['v_hawk'].rolling(VOLATILITY_LOOKBACK).quantile(0.05)
+            self.trading_data['q95'] = self.trading_data['v_hawk'].rolling(VOLATILITY_LOOKBACK).quantile(0.95)
+            
+            # NaN 처리
+            self.trading_data['q05'] = self.trading_data['q05'].fillna(method='bfill').fillna(method='ffill')
+            self.trading_data['q95'] = self.trading_data['q95'].fillna(method='bfill').fillna(method='ffill')
+            
+            # 안전한 신호 생성 함수 사용
+            try:
+                # 안전한 함수 사용
+                self.trading_data['signal'] = vol_signal_safe(
+                    self.trading_data['close'], 
+                    self.trading_data['v_hawk'], 
+                    VOLATILITY_LOOKBACK
+                )
+            except Exception as signal_safe_error:
+                # 만약 안전한 함수에서 오류 발생 시 기존 함수 사용
+                logging.warning(f"안전한 신호 함수 사용 중 오류: {str(signal_safe_error)}, 기존 함수로 대체합니다.")
+                self.trading_data['signal'] = vol_signal(
+                    self.trading_data['close'], 
+                    self.trading_data['v_hawk'], 
+                    VOLATILITY_LOOKBACK
+                )
+            
+            # 롱 온리 전략 적용 (매도 신호 -1을 0으로 변환)
+            self.trading_data['signal'] = self.trading_data['signal'].apply(lambda x: 1 if x == 1 else 0)
+            
+            # 마지막 신호 저장
+            self.last_signal = self.trading_data['signal'].iloc[-1]
+            
+        except Exception as e:
+            error_msg = f"호크스 데이터 준비 오류: {str(e)}"
+            logging.error(error_msg)
+            self.send_to_slack(f"❌ {error_msg}")
+            # 오류 발생 시 초기화하지 않고 기존 데이터 유지
+            if 'signal' not in self.trading_data.columns:
+                self.trading_data['signal'] = 0
+                self.last_signal = 0
+    
+    def update_data(self):
+        """최신 데이터로 업데이트 - 완전히 새로운 방식"""
+        try:
+            # 1. 데이터 가져오기
             max_retries = 3
             retry_count = 0
-            new_candle = None
+            fresh_data = None
             
             while retry_count < max_retries:
                 try:
-                    new_candle = pyupbit.get_ohlcv(TICKER, interval=CANDLE_INTERVAL, count=2)
-                    if new_candle is not None and not new_candle.empty:
+                    # 기존 데이터 크기와 동일하게 한번에 가져옴 (항상 전체 데이터 리프레시)
+                    fresh_data = pyupbit.get_ohlcv(TICKER, interval=CANDLE_INTERVAL, count=LOOKBACK_HOURS)
+                    if fresh_data is not None and not fresh_data.empty:
                         break
                 except Exception as retry_e:
                     retry_count += 1
                     logging.warning(f"OHLCV 데이터 가져오기 재시도 {retry_count}/{max_retries}: {str(retry_e)}")
-                    time.sleep(1)  # 1초 대기 후 재시도
-            
-            if new_candle is None or new_candle.empty:
+                    time.sleep(1)
+                
+            if fresh_data is None or fresh_data.empty:
                 raise Exception("캔들 데이터를 가져오지 못했습니다.")
+                
+            # 2. 데이터 유효성 검사
+            is_valid, errors = self.validate_trading_data(fresh_data)
+            if not is_valid:
+                error_msg = f"가져온 데이터 유효성 검사 실패: {'; '.join(errors)}"
+                logging.warning(error_msg)
+                self.send_to_slack(f"⚠️ {error_msg}")
+                
+                # 중요한 오류가 있는 경우 (필수 열이 없거나 데이터가 너무 적은 경우) 중단
+                critical_errors = [e for e in errors if "필수 열이 누락" in e or "데이터 행 수가 부족" in e]
+                if critical_errors:
+                    raise Exception(f"중요한 데이터 오류: {'; '.join(critical_errors)}")
             
-            # 데이터 업데이트 방법 개선 - 안전하게 concat만 사용
-            # 마지막 기존 캔들 시간
-            last_candle_time = self.trading_data.index[-1]
+            # 3. 데이터 전처리 - 중복 제거 및 정렬
+            fresh_data = fresh_data[~fresh_data.index.duplicated(keep='last')]
+            fresh_data = fresh_data.sort_index()
             
-            # 상황 1: 새 데이터의 첫 번째 캔들이 마지막 기존 캔들과 같을 때 (업데이트)
-            if last_candle_time in new_candle.index:
-                # 일치하는 시간의 행 삭제 후 새 데이터 추가
-                self.trading_data = self.trading_data.drop(last_candle_time)
-                self.trading_data = pd.concat([self.trading_data, new_candle])
-            else:
-                # 상황 2: 완전히 새로운 캔들만 있는 경우
-                self.trading_data = pd.concat([self.trading_data, new_candle])
+            # 4. 데이터프레임 교체
+            self.trading_data = fresh_data
             
-            # 중복 인덱스 제거 (만약 있다면)
-            self.trading_data = self.trading_data[~self.trading_data.index.duplicated(keep='last')]
+            # 5. 호크스 프로세스 계산을 위한 컬럼 추가
+            self.trading_data['log_high'] = np.log(self.trading_data['high'])
+            self.trading_data['log_low'] = np.log(self.trading_data['low'])
+            self.trading_data['log_close'] = np.log(self.trading_data['close'])
             
-            # 인덱스 기준 정렬
-            self.trading_data = self.trading_data.sort_index()
+            # 6. ATR 계산 - 예외 처리 강화
+            try:
+                norm_lookback = 336
+                self.trading_data['atr'] = ta.atr(
+                    high=self.trading_data['log_high'], 
+                    low=self.trading_data['log_low'], 
+                    close=self.trading_data['log_close'], 
+                    length=norm_lookback
+                )
+                
+                # ATR NaN 처리
+                self.trading_data['atr'] = self.trading_data['atr'].fillna(method='bfill').fillna(method='ffill')
+                
+                # 정규화된 범위 계산
+                self.trading_data['norm_range'] = (
+                    self.trading_data['log_high'] - self.trading_data['log_low']
+                ) / self.trading_data['atr']
+                
+            except Exception as atr_error:
+                logging.error(f"ATR 계산 오류: {str(atr_error)}")
+                self.send_to_slack(f"❌ ATR 계산 오류: {str(atr_error)}")
+                raise
             
-            # 데이터가 너무 많아지면 오래된 데이터 삭제
-            if len(self.trading_data) > LOOKBACK_HOURS:
-                self.trading_data = self.trading_data.iloc[-LOOKBACK_HOURS:]
+            # 7. 호크스 프로세스 적용 - 예외 처리 강화
+            try:
+                self.trading_data['v_hawk'] = hawkes_process(self.trading_data['norm_range'], KAPPA)
+                
+                # 변동성 분위수 계산
+                self.trading_data['q05'] = self.trading_data['v_hawk'].rolling(VOLATILITY_LOOKBACK).quantile(0.05)
+                self.trading_data['q95'] = self.trading_data['v_hawk'].rolling(VOLATILITY_LOOKBACK).quantile(0.95)
+                
+                # NaN 처리
+                self.trading_data['q05'] = self.trading_data['q05'].fillna(method='bfill').fillna(method='ffill')
+                self.trading_data['q95'] = self.trading_data['q95'].fillna(method='bfill').fillna(method='ffill')
+                
+            except Exception as hawk_error:
+                logging.error(f"호크스 프로세스 계산 오류: {str(hawk_error)}")
+                self.send_to_slack(f"❌ 호크스 프로세스 계산 오류: {str(hawk_error)}")
+                raise
             
-            # 호크스 프로세스 업데이트
-            self.prepare_hawkes_data()
+            # 8. 개선된 vol_signal 함수 사용하여 신호 생성
+            try:
+                # 개선된 함수 사용 
+                self.trading_data['signal'] = vol_signal_safe(
+                    self.trading_data['close'], 
+                    self.trading_data['v_hawk'], 
+                    VOLATILITY_LOOKBACK
+                )
+                
+                # 롱 온리 전략으로 변환 (매도 신호 제거)
+                self.trading_data['signal'] = self.trading_data['signal'].apply(lambda x: 1 if x == 1 else 0)
+                
+            except Exception as signal_error:
+                logging.error(f"신호 계산 오류: {str(signal_error)}")
+                self.send_to_slack(f"❌ 신호 계산 오류: {str(signal_error)}")
+                # 오류 발생 시 모든 신호 중립으로 설정
+                self.trading_data['signal'] = 0
             
-            # 새 캔들 정보 로깅
+            # 9. 최종 데이터 유효성 검사
+            final_validation_columns = ['open', 'high', 'low', 'close', 'volume', 
+                                       'v_hawk', 'q05', 'q95', 'signal']
+            is_valid, errors = self.validate_trading_data(
+                self.trading_data, 
+                required_columns=final_validation_columns
+            )
+            
+            if not is_valid:
+                warning_msg = f"최종 데이터 유효성 검사 경고: {'; '.join(errors)}"
+                logging.warning(warning_msg)
+                # 경고만 표시하고 계속 진행 (Slack에는 보내지 않음)
+            
+            # 10. 마지막 신호 저장
+            self.last_signal = self.trading_data['signal'].iloc[-1]
+            
+            # 11. 새 캔들 정보 로깅
             last_candle = self.trading_data.iloc[-1]
-            
-            # Slack으로 새 캔들 정보 전송
             candle_info = (
                 f"📈 새 캔들 업데이트 ({self.trading_data.index[-1].strftime('%Y-%m-%d %H:%M')})\n"
                 f"가격: {last_candle['close']:,.0f} KRW (고가: {last_candle['high']:,.0f}, 저가: {last_candle['low']:,.0f})\n"
@@ -389,6 +552,7 @@ class EC2HawkesTrader:
             error_msg = f"데이터 업데이트 오류: {str(e)}"
             logging.error(error_msg)
             self.send_to_slack(f"❌ {error_msg}")
+            # 오류 발생 시에도 프로그램 계속 실행 (다음 주기에 재시도)
     
     def check_signal(self):
         """현재 거래 신호 확인"""
