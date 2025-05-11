@@ -17,3 +17,5 @@ services:
       - TZ=Asia/Seoul
       - HOST_IP=3.82.149.232
       - WEB_PORT=8500
+      - KAPPA=0.3
+      - VOLATILITY_LOOKBACK=72
