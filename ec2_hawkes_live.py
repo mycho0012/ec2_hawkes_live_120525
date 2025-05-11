@@ -6,6 +6,7 @@ import pandas as pd
 import json
 import logging
 import argparse
+import traceback
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from dotenv import load_dotenv
@@ -47,7 +48,7 @@ fix_pandas_ta()
 
 # 이제 안전하게 pandas_ta 임포트
 import pandas_ta as ta
-from hawkes import hawkes_process, vol_signal, vol_signal_safe
+from hawkes import hawkes_process, hawkes_process_np, vol_signal_np
 
 # 로깅 설정
 logging.basicConfig(
@@ -122,6 +123,22 @@ class EC2HawkesTrader:
         self.trading_data = pd.DataFrame()
         self.last_signal = 0
         
+        # 데이터 캐시 - NumPy 배열 기반으로 전환
+        self._data_cache = {
+            'dates': [],       # 날짜/시간 (타임스탬프)
+            'open': np.array([]),      # 시가
+            'high': np.array([]),      # 고가
+            'low': np.array([]),       # 저가
+            'close': np.array([]),     # 종가
+            'volume': np.array([]),    # 거래량
+            'atr': np.array([]),       # ATR
+            'norm_range': np.array([]),# 정규화된 범위
+            'v_hawk': np.array([]),    # 호크스 값
+            'q05': np.array([]),       # 5% 분위수
+            'q95': np.array([]),       # 95% 분위수
+            'signal': np.array([])     # 거래 신호
+        }
+        
         # 거래 기록
         self.trade_history = []
         self.num_trades = 0  # 총 거래 횟수 추적
@@ -135,59 +152,6 @@ class EC2HawkesTrader:
         
         # 초기 데이터 로드
         self.load_initial_data()
-    
-    def validate_trading_data(self, data, min_rows=10, required_columns=None):
-        """데이터프레임 유효성 검사 함수"""
-        if required_columns is None:
-            required_columns = ['open', 'high', 'low', 'close', 'volume']
-        
-        validation_errors = []
-        
-        # 1. 데이터프레임이 비어있는지 확인
-        if data is None or data.empty:
-            validation_errors.append("데이터프레임이 비어 있습니다.")
-            return False, validation_errors
-        
-        # 2. 최소 행 수 확인
-        if len(data) < min_rows:
-            validation_errors.append(f"데이터 행 수가 부족합니다. (현재: {len(data)}, 최소 필요: {min_rows})")
-        
-        # 3. 필수 열 존재 확인
-        missing_columns = [col for col in required_columns if col not in data.columns]
-        if missing_columns:
-            validation_errors.append(f"필수 열이 누락되었습니다: {missing_columns}")
-        
-        # 4. 중복 인덱스 확인
-        duplicate_indices = data.index.duplicated()
-        if duplicate_indices.any():
-            duplicate_count = duplicate_indices.sum()
-            validation_errors.append(f"중복된 인덱스가 있습니다: {duplicate_count}개")
-        
-        # 5. NaN 값 확인 (OHLC 데이터)
-        for col in ['open', 'high', 'low', 'close']:
-            if col in data.columns and data[col].isna().any():
-                nan_count = data[col].isna().sum()
-                validation_errors.append(f"'{col}' 열에 NaN 값이 있습니다: {nan_count}개")
-        
-        # 6. 시간 순서 확인
-        if not data.index.is_monotonic_increasing:
-            validation_errors.append("인덱스가 시간 순서대로 정렬되어 있지 않습니다.")
-        
-        # 7. OHLC 데이터 일관성 확인 (high >= low, high >= open, high >= close)
-        if {'high', 'low', 'open', 'close'}.issubset(set(data.columns)):
-            if (data['high'] < data['low']).any():
-                inconsistent_count = (data['high'] < data['low']).sum()
-                validation_errors.append(f"고가(high)가 저가(low)보다 낮은 행이 있습니다: {inconsistent_count}개")
-            
-            if (data['high'] < data['open']).any():
-                inconsistent_count = (data['high'] < data['open']).sum()
-                validation_errors.append(f"고가(high)가 시가(open)보다 낮은 행이 있습니다: {inconsistent_count}개")
-            
-            if (data['high'] < data['close']).any():
-                inconsistent_count = (data['high'] < data['close']).sum()
-                validation_errors.append(f"고가(high)가 종가(close)보다 낮은 행이 있습니다: {inconsistent_count}개")
-        
-        return len(validation_errors) == 0, validation_errors
         
     def start_http_server(self):
         """간단한 HTTP 서버 시작"""
@@ -252,21 +216,30 @@ class EC2HawkesTrader:
             # OHLCV 데이터 가져오기
             df = pyupbit.get_ohlcv(TICKER, interval=CANDLE_INTERVAL, count=LOOKBACK_HOURS)
             
-            # 데이터 유효성 검사
-            is_valid, errors = self.validate_trading_data(df)
-            if not is_valid:
-                warning_msg = f"초기 데이터 유효성 검사 경고: {'; '.join(errors)}"
-                logging.warning(warning_msg)
-                self.send_to_slack(f"⚠️ {warning_msg}")
-            
             # 중복 제거 및 정렬
             df = df[~df.index.duplicated(keep='last')]
             df = df.sort_index()
             
+            # 데이터프레임 저장
             self.trading_data = df.copy()
             
+            # NumPy 캐시에 저장
+            self._data_cache['dates'] = df.index.tolist()
+            self._data_cache['open'] = df['open'].to_numpy()
+            self._data_cache['high'] = df['high'].to_numpy()
+            self._data_cache['low'] = df['low'].to_numpy()
+            self._data_cache['close'] = df['close'].to_numpy()
+            self._data_cache['volume'] = df['volume'].to_numpy()
+            
             # 호크스 프로세스 적용 준비
-            self.prepare_hawkes_data()
+            self._calculate_hawkes_process()
+            
+            # 마지막 신호 업데이트
+            if len(self._data_cache['signal']) > 0:
+                self.last_signal = int(self._data_cache['signal'][-1])
+            
+            # 데이터프레임에 NumPy 계산 결과 반영
+            self._update_dataframe_from_cache()
             
             log_msg = f"초기 데이터 로드 완료: {len(self.trading_data)} 개의 캔들"
             logging.info(log_msg)
@@ -287,6 +260,424 @@ class EC2HawkesTrader:
             logging.error(error_msg)
             self.send_to_slack(f"❌ {error_msg}")
             raise
+    
+    def _calculate_hawkes_process(self):
+        """NumPy 기반 호크스 프로세스 계산"""
+        try:
+            length = len(self._data_cache['close'])
+            
+            if length == 0:
+                return
+            
+            # 로그 변환
+            log_high = np.log(self._data_cache['high'])
+            log_low = np.log(self._data_cache['low'])
+            log_close = np.log(self._data_cache['close'])
+            
+            # ATR 계산 (pandas_ta 사용)
+            # 여기서는 판다스 사용이 불가피함 - 임시 데이터프레임 생성
+            temp_df = pd.DataFrame({
+                'high': log_high,
+                'low': log_low,
+                'close': log_close
+            })
+            atr = ta.atr(temp_df['high'], temp_df['low'], temp_df['close'], length=336)
+            self._data_cache['atr'] = atr.to_numpy()
+            
+            # NaN 제거
+            for i in range(1, len(self._data_cache['atr'])):
+                if np.isnan(self._data_cache['atr'][i]):
+                    self._data_cache['atr'][i] = self._data_cache['atr'][i-1]
+            
+            # 첫 원소가 NaN이면 다음 유효한 값으로 채우기
+            if np.isnan(self._data_cache['atr'][0]) and len(self._data_cache['atr']) > 1:
+                for i in range(1, len(self._data_cache['atr'])):
+                    if not np.isnan(self._data_cache['atr'][i]):
+                        self._data_cache['atr'][0] = self._data_cache['atr'][i]
+                        break
+            
+            # 정규화된 범위 계산
+            self._data_cache['norm_range'] = (log_high - log_low) / self._data_cache['atr']
+            
+            # NaN 대체
+            for i in range(len(self._data_cache['norm_range'])):
+                if np.isnan(self._data_cache['norm_range'][i]) or np.isinf(self._data_cache['norm_range'][i]):
+                    self._data_cache['norm_range'][i] = 0.0
+            
+            # 호크스 프로세스 적용 (순수 NumPy 계산)
+            self._data_cache['v_hawk'] = hawkes_process_np(self._data_cache['norm_range'], KAPPA)
+            
+            # 변동성 분위수 계산 및 신호 생성을 합쳐서 한 번에 수행
+            self._data_cache['signal'] = np.zeros(length)
+            self._data_cache['q05'] = np.zeros(length)
+            self._data_cache['q95'] = np.zeros(length)
+            
+            # 최소 룩백 기간이 필요함
+            if length < VOLATILITY_LOOKBACK:
+                return
+            
+            # 분위수 및 신호 계산
+            for i in range(VOLATILITY_LOOKBACK, length):
+                window = self._data_cache['v_hawk'][i-VOLATILITY_LOOKBACK:i]
+                self._data_cache['q05'][i] = np.percentile(window, 5)
+                self._data_cache['q95'][i] = np.percentile(window, 95)
+            
+            # 처음 값들 채우기
+            for i in range(VOLATILITY_LOOKBACK):
+                self._data_cache['q05'][i] = self._data_cache['q05'][VOLATILITY_LOOKBACK]
+                self._data_cache['q95'][i] = self._data_cache['q95'][VOLATILITY_LOOKBACK]
+            
+            # 신호 생성 (순수 NumPy 계산)
+            self._data_cache['signal'] = vol_signal_np(
+                self._data_cache['close'], 
+                self._data_cache['v_hawk'], 
+                VOLATILITY_LOOKBACK
+            )
+            
+            # 롱 온리 전략 적용 (매도 신호 -1을 0으로 변환)
+            for i in range(length):
+                if self._data_cache['signal'][i] < 0:
+                    self._data_cache['signal'][i] = 0
+            
+        except Exception as e:
+            error_msg = f"호크스 프로세스 계산 오류: {str(e)}"
+            logging.error(error_msg)
+            logging.error(f"스택 트레이스: {traceback.format_exc()}")
+            
+            # 신호 초기화
+            self._data_cache['signal'] = np.zeros(len(self._data_cache['close']))
+    
+    def _update_dataframe_from_cache(self):
+        """NumPy 캐시에서 데이터프레임 업데이트"""
+        try:
+            # 캐시 데이터 복제
+            indices = self._data_cache['dates']
+            
+            # 데이터 길이 체크
+            n = len(indices)
+            if n == 0:
+                return
+            
+            # 모든 NumPy 배열이 동일한 길이인지 확인
+            for key, arr in self._data_cache.items():
+                if key != 'dates' and len(arr) != n:
+                    logging.warning(f"캐시 불일치: {key} 배열 길이 {len(arr)}, 필요한 길이: {n}")
+                    # 길이 맞추기
+                    if len(arr) < n:
+                        pad_length = n - len(arr)
+                        self._data_cache[key] = np.append(arr, np.zeros(pad_length))
+                    else:
+                        self._data_cache[key] = arr[:n]
+            
+            # 전체 데이터프레임 새로 생성
+            new_df = pd.DataFrame(index=indices)
+            
+            # 기본 OHLCV 데이터
+            new_df['open'] = self._data_cache['open']
+            new_df['high'] = self._data_cache['high']
+            new_df['low'] = self._data_cache['low']
+            new_df['close'] = self._data_cache['close']
+            new_df['volume'] = self._data_cache['volume']
+            
+            # 로그 변환 및 ATR 계산 값
+            new_df['log_high'] = np.log(self._data_cache['high'])
+            new_df['log_low'] = np.log(self._data_cache['low'])
+            new_df['log_close'] = np.log(self._data_cache['close'])
+            new_df['atr'] = self._data_cache['atr']
+            new_df['norm_range'] = self._data_cache['norm_range']
+            
+            # 호크스 프로세스 관련 값
+            new_df['v_hawk'] = self._data_cache['v_hawk']
+            new_df['q05'] = self._data_cache['q05']
+            new_df['q95'] = self._data_cache['q95']
+            new_df['signal'] = self._data_cache['signal']
+            
+            # 데이터프레임 교체
+            self.trading_data = new_df
+        
+        except Exception as e:
+            error_msg = f"데이터프레임 업데이트 오류: {str(e)}"
+            logging.error(error_msg)
+            logging.error(f"스택 트레이스: {traceback.format_exc()}")
+    
+    def update_data(self):
+        """NumPy 기반 데이터 업데이트 (완전히 새로운 방식)"""
+        try:
+            # 새 데이터 가져오기
+            max_retries = 3
+            retry_count = 0
+            fresh_data = None
+            
+            while retry_count < max_retries:
+                try:
+                    # 항상 전체 데이터 새로 가져오기
+                    fresh_data = pyupbit.get_ohlcv(TICKER, interval=CANDLE_INTERVAL, count=LOOKBACK_HOURS)
+                    if fresh_data is not None and not fresh_data.empty:
+                        break
+                except Exception as retry_e:
+                    retry_count += 1
+                    logging.warning(f"OHLCV 데이터 가져오기 재시도 {retry_count}/{max_retries}: {str(retry_e)}")
+                    time.sleep(1)
+            
+            if fresh_data is None or fresh_data.empty:
+                raise Exception("캔들 데이터를 가져오지 못했습니다.")
+            
+            # 중복 제거 및 정렬
+            fresh_data = fresh_data[~fresh_data.index.duplicated(keep='last')]
+            fresh_data = fresh_data.sort_index()
+            
+            # NumPy 캐시 완전히 초기화
+            self._data_cache['dates'] = fresh_data.index.tolist()
+            self._data_cache['open'] = fresh_data['open'].to_numpy()
+            self._data_cache['high'] = fresh_data['high'].to_numpy()
+            self._data_cache['low'] = fresh_data['low'].to_numpy()
+            self._data_cache['close'] = fresh_data['close'].to_numpy()
+            self._data_cache['volume'] = fresh_data['volume'].to_numpy()
+            
+            # 호크스 프로세스 계산
+            self._calculate_hawkes_process()
+            
+            # 데이터프레임 업데이트 
+            self._update_dataframe_from_cache()
+            
+            # 신호 업데이트
+            if len(self._data_cache['signal']) > 0:
+                self.last_signal = int(self._data_cache['signal'][-1])
+            
+            # 새 캔들 정보 로깅
+            last_candle_idx = len(self._data_cache['dates']) - 1
+            if last_candle_idx >= 0:
+                last_date = self._data_cache['dates'][last_candle_idx]
+                last_close = self._data_cache['close'][last_candle_idx]
+                last_high = self._data_cache['high'][last_candle_idx]
+                last_low = self._data_cache['low'][last_candle_idx]
+                last_v_hawk = self._data_cache['v_hawk'][last_candle_idx]
+                last_q05 = self._data_cache['q05'][last_candle_idx]
+                last_q95 = self._data_cache['q95'][last_candle_idx]
+                last_sig = self._data_cache['signal'][last_candle_idx]
+                
+                # Slack으로 새 캔들 정보 전송
+                date_str = last_date.strftime('%Y-%m-%d %H:%M') if hasattr(last_date, 'strftime') else str(last_date)
+                candle_info = (
+                    f"📈 새 캔들 업데이트 ({date_str})\n"
+                    f"가격: {last_close:,.0f} KRW (고가: {last_high:,.0f}, 저가: {last_low:,.0f})\n"
+                    f"호크스값: {last_v_hawk:.4f} (5% 밴드: {last_q05:.4f}, 95% 밴드: {last_q95:.4f})\n"
+                    f"현재 신호: {'매수' if last_sig == 1 else '중립'}"
+                )
+                self.send_to_slack(candle_info)
+            
+            logging.info(f"데이터 업데이트 완료")
+            
+        except Exception as e:
+            error_msg = f"데이터 업데이트 오류: {str(e)}"
+            logging.error(error_msg)
+            import traceback
+            logging.error(f"스택 트레이스: {traceback.format_exc()}")
+            self.send_to_slack(f"❌ {error_msg}")
+    
+    def check_signal(self):
+        """현재 거래 신호 확인"""
+        try:
+            if len(self._data_cache['signal']) == 0:
+                return None
+            
+            current_signal = int(self._data_cache['signal'][-1])
+            
+            # 신호 변화 감지
+            if current_signal != self.last_signal:
+                signal_change_msg = f"신호 변경: {self.last_signal} -> {current_signal}"
+                logging.info(signal_change_msg)
+                
+                # Slack으로 신호 변경 알림
+                signal_text = "중립" if current_signal == 0 else "매수"
+                self.send_to_slack(f"🔔 신호 변경: {'매수' if self.last_signal == 1 else '중립'} -> {signal_text}")
+                
+                self.last_signal = current_signal
+                return current_signal
+            
+            return None
+        except Exception as e:
+            error_msg = f"신호 확인 오류: {str(e)}"
+            logging.error(error_msg)
+            self.send_to_slack(f"❌ {error_msg}")
+            return None
+    
+    def execute_trade(self, signal):
+        """거래 실행 - 전체 KRW로 매수 또는 전체 BTC 매도"""
+        current_price = pyupbit.get_current_price(TICKER)
+        
+        try:
+            # 새로운 매수 신호 (현재 중립 상태일 때)
+            if self.current_position == 0 and signal == 1:
+                # 현재 KRW 잔고 확인
+                krw_balance = self.upbit.get_balance("KRW")
+                
+                if krw_balance > 10000:  # 최소 주문 금액 이상인지 확인
+                    buy_msg = f"매수 신호: {current_price:,.0f} KRW에 {krw_balance:,.0f} KRW 매수"
+                    logging.info(buy_msg)
+                    self.send_to_slack(f"🔴 {buy_msg}")
+                    
+                    # 수수료 고려하여 실제 매수 금액 계산
+                    buy_amount = krw_balance * (1 - COMMISSION_RATE)
+                    
+                    # 시장가 매수 주문
+                    order = self.upbit.buy_market_order(TICKER, buy_amount)
+                    
+                    if order and 'uuid' in order:
+                        # 주문 체결 확인
+                        time.sleep(2)  # 체결 대기
+                        order_detail = self.upbit.get_order(order['uuid'])
+                        
+                        if order_detail and 'trades' in order_detail and len(order_detail['trades']) > 0:
+                            # 체결된 평균 가격 계산
+                            total_price = sum(float(t['price']) * float(t['volume']) for t in order_detail['trades'])
+                            total_volume = sum(float(t['volume']) for t in order_detail['trades'])
+                            avg_price = total_price / total_volume if total_volume > 0 else current_price
+                            
+                            self.current_position = 1
+                            self.position_entry_price = avg_price
+                            self.position_entry_time = datetime.datetime.now()
+                            self.num_trades += 1  # 거래 횟수 증가
+                            
+                            trade_info = {
+                                'time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'type': 'buy',
+                                'price': avg_price,
+                                'amount': total_volume,
+                                'value': total_price,
+                                'hawk_value': float(self._data_cache['v_hawk'][-1]),
+                                'q95_value': float(self._data_cache['q95'][-1])
+                            }
+                            self.trade_history.append(trade_info)
+                            
+                            # 매수 결과 로깅 및 Slack 알림
+                            buy_result_msg = f"매수 완료: {avg_price:,.0f} KRW, {total_volume:.8f} BTC, 총액: {total_price:,.0f} KRW"
+                            logging.info(buy_result_msg)
+                            
+                            # 호크스 프로세스 정보 포함
+                            hawk_info = (
+                                f"🔴 매수 체결 완료\n"
+                                f"가격: {avg_price:,.0f} KRW\n"
+                                f"수량: {total_volume:.8f} BTC\n"
+                                f"총액: {total_price:,.0f} KRW\n"
+                                f"호크스값: {float(self._data_cache['v_hawk'][-1]):.4f}\n"
+                                f"95% 밴드: {float(self._data_cache['q95'][-1]):.4f}\n"
+                                f"총 거래 횟수: {self.num_trades}"
+                            )
+                            self.send_to_slack(hawk_info)
+                else:
+                    empty_balance_msg = f"매수 신호 무시: 잔고 부족 (KRW: {krw_balance:,.0f})"
+                    logging.info(empty_balance_msg)
+                    self.send_to_slack(f"⚠️ {empty_balance_msg}")
+            
+            # 매도 신호 (현재 롱 포지션에서 중립 신호)
+            elif self.current_position == 1 and signal == 0:
+                # 보유 BTC 수량 확인
+                btc_balance = self.upbit.get_balance(TICKER.split('-')[1])
+                
+                if btc_balance > 0:
+                    sell_msg = f"매도 신호: {current_price:,.0f} KRW에 {btc_balance:.8f} BTC 매도"
+                    logging.info(sell_msg)
+                    self.send_to_slack(f"🔵 {sell_msg}")
+                    
+                    # 시장가 매도 주문
+                    order = self.upbit.sell_market_order(TICKER, btc_balance)
+                    
+                    if order and 'uuid' in order:
+                        # 주문 체결 확인
+                        time.sleep(2)  # 체결 대기
+                        order_detail = self.upbit.get_order(order['uuid'])
+                        
+                        if order_detail and 'trades' in order_detail and len(order_detail['trades']) > 0:
+                            # 체결된 평균 가격 계산
+                            total_price = sum(float(t['price']) * float(t['volume']) for t in order_detail['trades'])
+                            total_volume = sum(float(t['volume']) for t in order_detail['trades'])
+                            avg_price = total_price / total_volume if total_volume > 0 else current_price
+                            
+                            # 수익률 계산
+                            profit_pct = (avg_price - self.position_entry_price) / self.position_entry_price
+                            
+                            self.current_position = 0
+                            self.num_trades += 1  # 거래 횟수 증가
+                            
+                            trade_info = {
+                                'time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'type': 'sell',
+                                'price': avg_price,
+                                'amount': total_volume,
+                                'value': total_price,
+                                'profit_pct': profit_pct * 100,  # 수익률 %
+                                'hawk_value': float(self._data_cache['v_hawk'][-1])
+                            }
+                            self.trade_history.append(trade_info)
+                            
+                            # 매도 결과 로깅 및 Slack 알림
+                            sell_result_msg = f"매도 완료: {avg_price:,.0f} KRW, {total_volume:.8f} BTC, 수익률: {profit_pct*100:.2f}%"
+                            logging.info(sell_result_msg)
+                            
+                            # Slack에 매도 결과 알림
+                            sell_info = (
+                                f"🔵 매도 체결 완료\n"
+                                f"가격: {avg_price:,.0f} KRW\n"
+                                f"수량: {total_volume:.8f} BTC\n"
+                                f"총액: {total_price:,.0f} KRW\n"
+                                f"수익률: {profit_pct*100:.2f}%\n"
+                                f"호크스값: {float(self._data_cache['v_hawk'][-1]):.4f}\n"
+                                f"총 거래 횟수: {self.num_trades}"
+                            )
+                            self.send_to_slack(sell_info)
+                else:
+                    empty_btc_msg = f"매도 신호 무시: BTC 잔고 없음"
+                    logging.info(empty_btc_msg)
+                    self.send_to_slack(f"⚠️ {empty_btc_msg}")
+            
+        except Exception as e:
+            error_msg = f"거래 실행 오류: {str(e)}"
+            logging.error(error_msg)
+            self.send_to_slack(f"❌ {error_msg}")
+    
+    def log_account_info(self):
+        """계좌 정보 로깅"""
+        try:
+            krw_balance = self.upbit.get_balance("KRW")
+            btc_balance = self.upbit.get_balance("BTC")
+            btc_value = btc_balance * pyupbit.get_current_price(TICKER) if btc_balance > 0 else 0
+            total_value = krw_balance + btc_value
+            
+            account_msg = f"계좌 정보 - KRW: {krw_balance:,.2f}, BTC: {btc_balance:.8f} (가치: {btc_value:,.2f} KRW), 총액: {total_value:,.2f} KRW"
+            logging.info(account_msg)
+            
+            # Slack으로 계좌 정보 전송
+            account_info = (
+                f"💰 계좌 정보\n"
+                f"KRW 잔고: {krw_balance:,.2f} KRW\n"
+                f"BTC 보유량: {btc_balance:.8f} BTC\n"
+                f"BTC 가치: {btc_value:,.2f} KRW\n"
+                f"총 자산: {total_value:,.2f} KRW\n"
+                f"포지션: {'매수 중' if self.current_position == 1 else '중립'}\n"
+                f"총 거래 횟수: {self.num_trades}"
+            )
+            self.send_to_slack(account_info)
+            
+        except Exception as e:
+            error_msg = f"계좌 정보 로깅 오류: {str(e)}"
+            logging.error(error_msg)
+            self.send_to_slack(f"❌ {error_msg}")
+    
+    def save_trade_history(self):
+        """거래 기록 저장"""
+        if self.trade_history:
+            try:
+                # 기존 거래 기록 저장
+                with open('ec2_trade_history.json', 'w') as f:
+                    json.dump(self.trade_history, f)
+                
+                logging.info("거래 기록 저장 완료")
+                
+            except Exception as e:
+                error_msg = f"거래 기록 저장 오류: {str(e)}"
+                logging.error(error_msg)
+                self.send_to_slack(f"❌ {error_msg}")
     
     def calculate_performance_metrics(self):
         """백테스팅 성능 지표 계산 및 로깅"""
@@ -347,407 +738,76 @@ class EC2HawkesTrader:
             error_msg = f"성능 지표 계산 오류: {str(e)}"
             logging.error(error_msg)
             self.send_to_slack(f"❌ {error_msg}")
-            
-    def prepare_hawkes_data(self):
-        """ATR 계산 및 호크스 프로세스 적용 - 안전한 버전"""
+    
+    def calculate_backtest_metrics(self):
+        """백테스트 성능 지표 계산"""
         try:
-            # 정규화된 범위 계산
-            self.trading_data['log_high'] = np.log(self.trading_data['high'])
-            self.trading_data['log_low'] = np.log(self.trading_data['low'])
-            self.trading_data['log_close'] = np.log(self.trading_data['close'])
+            data = self.trading_data.copy()
             
-            # ATR 계산 (pandas_ta 사용)
-            norm_lookback = 336  # 14일 (시간 단위)
-            self.trading_data['atr'] = ta.atr(
-                high=self.trading_data['log_high'], 
-                low=self.trading_data['log_low'], 
-                close=self.trading_data['log_close'], 
-                length=norm_lookback
-            )
+            # 백테스트 기간 설정 (최근 500개 데이터)
+            if len(data) > 500:
+                data = data.iloc[-500:]
+                
+            # 수익률 계산
+            data['next_return'] = np.log(data['close']).diff().shift(-1)
+            data['signal_return'] = data['signal'] * data['next_return']
             
-            # ATR NaN 처리
-            self.trading_data['atr'] = self.trading_data['atr'].fillna(method='bfill').fillna(method='ffill')
+            # NaN 제거
+            data['signal_return'].fillna(0, inplace=True)
             
-            # 정규화된 범위
-            self.trading_data['norm_range'] = (
-                self.trading_data['log_high'] - self.trading_data['log_low']
-            ) / self.trading_data['atr']
+            # Win/Loss 계산
+            win_returns = data[data['signal_return'] > 0]['signal_return'].sum()
+            lose_returns = data[data['signal_return'] < 0]['signal_return'].abs().sum()
             
-            # 호크스 프로세스 적용
-            self.trading_data['v_hawk'] = hawkes_process(self.trading_data['norm_range'], KAPPA)
+            # Profit Factor
+            signal_pf = win_returns / lose_returns if lose_returns > 0 else 0
             
-            # 변동성 분위수 계산
-            self.trading_data['q05'] = self.trading_data['v_hawk'].rolling(VOLATILITY_LOOKBACK).quantile(0.05)
-            self.trading_data['q95'] = self.trading_data['v_hawk'].rolling(VOLATILITY_LOOKBACK).quantile(0.95)
+            # 거래 횟수 계산 (신호 변화 감지)
+            signal_changes = data['signal'].diff().abs()
+            total_trades = signal_changes[signal_changes > 0].count()
             
-            # NaN 처리
-            self.trading_data['q05'] = self.trading_data['q05'].fillna(method='bfill').fillna(method='ffill')
-            self.trading_data['q95'] = self.trading_data['q95'].fillna(method='bfill').fillna(method='ffill')
+            # 롱 진입/청산 식별
+            signal_to_long = data['signal'].diff() == 1  # 0→1 : 매수 진입
+            signal_to_neutral = data['signal'].diff() == -1  # 1→0 : 매수 청산
             
-            # 안전한 신호 생성 함수 사용
-            try:
-                # 안전한 함수 사용
-                self.trading_data['signal'] = vol_signal_safe(
-                    self.trading_data['close'], 
-                    self.trading_data['v_hawk'], 
-                    VOLATILITY_LOOKBACK
-                )
-            except Exception as signal_safe_error:
-                # 만약 안전한 함수에서 오류 발생 시 기존 함수 사용
-                logging.warning(f"안전한 신호 함수 사용 중 오류: {str(signal_safe_error)}, 기존 함수로 대체합니다.")
-                self.trading_data['signal'] = vol_signal(
-                    self.trading_data['close'], 
-                    self.trading_data['v_hawk'], 
-                    VOLATILITY_LOOKBACK
-                )
+            # 승률 계산
+            long_win_count = 0
+            long_total = 0
+            last_signal = 0
+            entry_price = 0
             
-            # 롱 온리 전략 적용 (매도 신호 -1을 0으로 변환)
-            self.trading_data['signal'] = self.trading_data['signal'].apply(lambda x: 1 if x == 1 else 0)
+            for i in range(1, len(data)):
+                if data['signal'].iloc[i] == 1 and last_signal == 0:  # 매수 진입
+                    entry_price = data['close'].iloc[i]
+                    last_signal = 1
+                elif data['signal'].iloc[i] == 0 and last_signal == 1:  # 매수 청산
+                    exit_price = data['close'].iloc[i]
+                    long_total += 1
+                    if exit_price > entry_price:
+                        long_win_count += 1
+                    last_signal = 0
             
-            # 마지막 신호 저장
-            self.last_signal = self.trading_data['signal'].iloc[-1]
+            win_rate = (long_win_count / long_total * 100) if long_total > 0 else 0
             
+            # 누적 수익률
+            data['cumulative_return'] = data['signal_return'].cumsum()
+            total_return = (np.exp(data['cumulative_return'].iloc[-1]) - 1) * 100 if len(data) > 0 else 0
+            
+            # 결과 반환
+            return {
+                'profit_factor': signal_pf,
+                'total_trades': total_trades,
+                'win_rate': win_rate,
+                'total_return': total_return
+            }
         except Exception as e:
-            error_msg = f"호크스 데이터 준비 오류: {str(e)}"
-            logging.error(error_msg)
-            self.send_to_slack(f"❌ {error_msg}")
-            # 오류 발생 시 초기화하지 않고 기존 데이터 유지
-            if 'signal' not in self.trading_data.columns:
-                self.trading_data['signal'] = 0
-                self.last_signal = 0
-    
-    def update_data(self):
-        """최신 데이터로 업데이트 - 완전히 새로운 방식"""
-        try:
-            # 1. 데이터 가져오기
-            max_retries = 3
-            retry_count = 0
-            fresh_data = None
-            
-            while retry_count < max_retries:
-                try:
-                    # 기존 데이터 크기와 동일하게 한번에 가져옴 (항상 전체 데이터 리프레시)
-                    fresh_data = pyupbit.get_ohlcv(TICKER, interval=CANDLE_INTERVAL, count=LOOKBACK_HOURS)
-                    if fresh_data is not None and not fresh_data.empty:
-                        break
-                except Exception as retry_e:
-                    retry_count += 1
-                    logging.warning(f"OHLCV 데이터 가져오기 재시도 {retry_count}/{max_retries}: {str(retry_e)}")
-                    time.sleep(1)
-                
-            if fresh_data is None or fresh_data.empty:
-                raise Exception("캔들 데이터를 가져오지 못했습니다.")
-                
-            # 2. 데이터 유효성 검사
-            is_valid, errors = self.validate_trading_data(fresh_data)
-            if not is_valid:
-                error_msg = f"가져온 데이터 유효성 검사 실패: {'; '.join(errors)}"
-                logging.warning(error_msg)
-                self.send_to_slack(f"⚠️ {error_msg}")
-                
-                # 중요한 오류가 있는 경우 (필수 열이 없거나 데이터가 너무 적은 경우) 중단
-                critical_errors = [e for e in errors if "필수 열이 누락" in e or "데이터 행 수가 부족" in e]
-                if critical_errors:
-                    raise Exception(f"중요한 데이터 오류: {'; '.join(critical_errors)}")
-            
-            # 3. 데이터 전처리 - 중복 제거 및 정렬
-            fresh_data = fresh_data[~fresh_data.index.duplicated(keep='last')]
-            fresh_data = fresh_data.sort_index()
-            
-            # 4. 데이터프레임 교체
-            self.trading_data = fresh_data
-            
-            # 5. 호크스 프로세스 계산을 위한 컬럼 추가
-            self.trading_data['log_high'] = np.log(self.trading_data['high'])
-            self.trading_data['log_low'] = np.log(self.trading_data['low'])
-            self.trading_data['log_close'] = np.log(self.trading_data['close'])
-            
-            # 6. ATR 계산 - 예외 처리 강화
-            try:
-                norm_lookback = 336
-                self.trading_data['atr'] = ta.atr(
-                    high=self.trading_data['log_high'], 
-                    low=self.trading_data['log_low'], 
-                    close=self.trading_data['log_close'], 
-                    length=norm_lookback
-                )
-                
-                # ATR NaN 처리
-                self.trading_data['atr'] = self.trading_data['atr'].fillna(method='bfill').fillna(method='ffill')
-                
-                # 정규화된 범위 계산
-                self.trading_data['norm_range'] = (
-                    self.trading_data['log_high'] - self.trading_data['log_low']
-                ) / self.trading_data['atr']
-                
-            except Exception as atr_error:
-                logging.error(f"ATR 계산 오류: {str(atr_error)}")
-                self.send_to_slack(f"❌ ATR 계산 오류: {str(atr_error)}")
-                raise
-            
-            # 7. 호크스 프로세스 적용 - 예외 처리 강화
-            try:
-                self.trading_data['v_hawk'] = hawkes_process(self.trading_data['norm_range'], KAPPA)
-                
-                # 변동성 분위수 계산
-                self.trading_data['q05'] = self.trading_data['v_hawk'].rolling(VOLATILITY_LOOKBACK).quantile(0.05)
-                self.trading_data['q95'] = self.trading_data['v_hawk'].rolling(VOLATILITY_LOOKBACK).quantile(0.95)
-                
-                # NaN 처리
-                self.trading_data['q05'] = self.trading_data['q05'].fillna(method='bfill').fillna(method='ffill')
-                self.trading_data['q95'] = self.trading_data['q95'].fillna(method='bfill').fillna(method='ffill')
-                
-            except Exception as hawk_error:
-                logging.error(f"호크스 프로세스 계산 오류: {str(hawk_error)}")
-                self.send_to_slack(f"❌ 호크스 프로세스 계산 오류: {str(hawk_error)}")
-                raise
-            
-            # 8. 개선된 vol_signal 함수 사용하여 신호 생성
-            try:
-                # 개선된 함수 사용 
-                self.trading_data['signal'] = vol_signal_safe(
-                    self.trading_data['close'], 
-                    self.trading_data['v_hawk'], 
-                    VOLATILITY_LOOKBACK
-                )
-                
-                # 롱 온리 전략으로 변환 (매도 신호 제거)
-                self.trading_data['signal'] = self.trading_data['signal'].apply(lambda x: 1 if x == 1 else 0)
-                
-            except Exception as signal_error:
-                logging.error(f"신호 계산 오류: {str(signal_error)}")
-                self.send_to_slack(f"❌ 신호 계산 오류: {str(signal_error)}")
-                # 오류 발생 시 모든 신호 중립으로 설정
-                self.trading_data['signal'] = 0
-            
-            # 9. 최종 데이터 유효성 검사
-            final_validation_columns = ['open', 'high', 'low', 'close', 'volume', 
-                                       'v_hawk', 'q05', 'q95', 'signal']
-            is_valid, errors = self.validate_trading_data(
-                self.trading_data, 
-                required_columns=final_validation_columns
-            )
-            
-            if not is_valid:
-                warning_msg = f"최종 데이터 유효성 검사 경고: {'; '.join(errors)}"
-                logging.warning(warning_msg)
-                # 경고만 표시하고 계속 진행 (Slack에는 보내지 않음)
-            
-            # 10. 마지막 신호 저장
-            self.last_signal = self.trading_data['signal'].iloc[-1]
-            
-            # 11. 새 캔들 정보 로깅
-            last_candle = self.trading_data.iloc[-1]
-            candle_info = (
-                f"📈 새 캔들 업데이트 ({self.trading_data.index[-1].strftime('%Y-%m-%d %H:%M')})\n"
-                f"가격: {last_candle['close']:,.0f} KRW (고가: {last_candle['high']:,.0f}, 저가: {last_candle['low']:,.0f})\n"
-                f"호크스값: {last_candle['v_hawk']:.4f} (5% 밴드: {last_candle['q05']:.4f}, 95% 밴드: {last_candle['q95']:.4f})\n"
-                f"현재 신호: {'매수' if last_candle['signal'] == 1 else '중립'}"
-            )
-            self.send_to_slack(candle_info)
-            
-            logging.info(f"데이터 업데이트 완료 - 마지막 캔들: {self.trading_data.index[-1]}")
-            
-        except Exception as e:
-            error_msg = f"데이터 업데이트 오류: {str(e)}"
-            logging.error(error_msg)
-            self.send_to_slack(f"❌ {error_msg}")
-            # 오류 발생 시에도 프로그램 계속 실행 (다음 주기에 재시도)
-    
-    def check_signal(self):
-        """현재 거래 신호 확인"""
-        current_signal = self.trading_data['signal'].iloc[-1]
-        
-        # 신호 변화 감지
-        if current_signal != self.last_signal:
-            signal_change_msg = f"신호 변경: {self.last_signal} -> {current_signal}"
-            logging.info(signal_change_msg)
-            
-            # Slack으로 신호 변경 알림
-            signal_text = "중립" if current_signal == 0 else "매수"
-            self.send_to_slack(f"🔔 신호 변경: {'매수' if self.last_signal == 1 else '중립'} -> {signal_text}")
-            
-            self.last_signal = current_signal
-            return current_signal
-        
-        return None
-    
-    def execute_trade(self, signal):
-        """거래 실행 - 전체 KRW로 매수 또는 전체 BTC 매도"""
-        current_price = pyupbit.get_current_price(TICKER)
-        
-        try:
-            # 새로운 매수 신호 (현재 중립 상태일 때)
-            if self.current_position == 0 and signal == 1:
-                # 현재 KRW 잔고 확인
-                krw_balance = self.upbit.get_balance("KRW")
-                
-                if krw_balance > 10000:  # 최소 주문 금액 이상인지 확인
-                    buy_msg = f"매수 신호: {current_price:,.0f} KRW에 {krw_balance:,.0f} KRW 매수"
-                    logging.info(buy_msg)
-                    self.send_to_slack(f"🔴 {buy_msg}")
-                    
-                    # 수수료 고려하여 실제 매수 금액 계산
-                    buy_amount = krw_balance * (1 - COMMISSION_RATE)
-                    
-                    # 시장가 매수 주문
-                    order = self.upbit.buy_market_order(TICKER, buy_amount)
-                    
-                    if order and 'uuid' in order:
-                        # 주문 체결 확인
-                        time.sleep(2)  # 체결 대기
-                        order_detail = self.upbit.get_order(order['uuid'])
-                        
-                        if order_detail and 'trades' in order_detail and len(order_detail['trades']) > 0:
-                            # 체결된 평균 가격 계산
-                            total_price = sum(float(t['price']) * float(t['volume']) for t in order_detail['trades'])
-                            total_volume = sum(float(t['volume']) for t in order_detail['trades'])
-                            avg_price = total_price / total_volume if total_volume > 0 else current_price
-                            
-                            self.current_position = 1
-                            self.position_entry_price = avg_price
-                            self.position_entry_time = datetime.datetime.now()
-                            self.num_trades += 1  # 거래 횟수 증가
-                            
-                            trade_info = {
-                                'time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                'type': 'buy',
-                                'price': avg_price,
-                                'amount': total_volume,
-                                'value': total_price,
-                                'hawk_value': self.trading_data['v_hawk'].iloc[-1],
-                                'q95_value': self.trading_data['q95'].iloc[-1]
-                            }
-                            self.trade_history.append(trade_info)
-                            
-                            # 매수 결과 로깅 및 Slack 알림
-                            buy_result_msg = f"매수 완료: {avg_price:,.0f} KRW, {total_volume:.8f} BTC, 총액: {total_price:,.0f} KRW"
-                            logging.info(buy_result_msg)
-                            
-                            # 호크스 프로세스 정보 포함
-                            hawk_info = (
-                                f"🔴 매수 체결 완료\n"
-                                f"가격: {avg_price:,.0f} KRW\n"
-                                f"수량: {total_volume:.8f} BTC\n"
-                                f"총액: {total_price:,.0f} KRW\n"
-                                f"호크스값: {self.trading_data['v_hawk'].iloc[-1]:.4f}\n"
-                                f"95% 밴드: {self.trading_data['q95'].iloc[-1]:.4f}\n"
-                                f"총 거래 횟수: {self.num_trades}"
-                            )
-                            self.send_to_slack(hawk_info)
-                else:
-                    empty_balance_msg = f"매수 신호 무시: 잔고 부족 (KRW: {krw_balance:,.0f})"
-                    logging.info(empty_balance_msg)
-                    self.send_to_slack(f"⚠️ {empty_balance_msg}")
-            
-            # 매도 신호 (현재 롱 포지션에서 중립 신호)
-            elif self.current_position == 1 and signal == 0:
-                # 보유 BTC 수량 확인
-                btc_balance = self.upbit.get_balance(TICKER.split('-')[1])
-                
-                if btc_balance > 0:
-                    sell_msg = f"매도 신호: {current_price:,.0f} KRW에 {btc_balance:.8f} BTC 매도"
-                    logging.info(sell_msg)
-                    self.send_to_slack(f"🔵 {sell_msg}")
-                    
-                    # 시장가 매도 주문
-                    order = self.upbit.sell_market_order(TICKER, btc_balance)
-                    
-                    if order and 'uuid' in order:
-                        # 주문 체결 확인
-                        time.sleep(2)  # 체결 대기
-                        order_detail = self.upbit.get_order(order['uuid'])
-                        
-                        if order_detail and 'trades' in order_detail and len(order_detail['trades']) > 0:
-                            # 체결된 평균 가격 계산
-                            total_price = sum(float(t['price']) * float(t['volume']) for t in order_detail['trades'])
-                            total_volume = sum(float(t['volume']) for t in order_detail['trades'])
-                            avg_price = total_price / total_volume if total_volume > 0 else current_price
-                            
-                            # 수익률 계산
-                            profit_pct = (avg_price - self.position_entry_price) / self.position_entry_price
-                            
-                            self.current_position = 0
-                            self.num_trades += 1  # 거래 횟수 증가
-                            
-                            trade_info = {
-                                'time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                'type': 'sell',
-                                'price': avg_price,
-                                'amount': total_volume,
-                                'value': total_price,
-                                'profit_pct': profit_pct * 100,  # 수익률 %
-                                'hawk_value': self.trading_data['v_hawk'].iloc[-1]
-                            }
-                            self.trade_history.append(trade_info)
-                            
-                            # 매도 결과 로깅 및 Slack 알림
-                            sell_result_msg = f"매도 완료: {avg_price:,.0f} KRW, {total_volume:.8f} BTC, 수익률: {profit_pct*100:.2f}%"
-                            logging.info(sell_result_msg)
-                            
-                            # Slack에 매도 결과 알림
-                            sell_info = (
-                                f"🔵 매도 체결 완료\n"
-                                f"가격: {avg_price:,.0f} KRW\n"
-                                f"수량: {total_volume:.8f} BTC\n"
-                                f"총액: {total_price:,.0f} KRW\n"
-                                f"수익률: {profit_pct*100:.2f}%\n"
-                                f"호크스값: {self.trading_data['v_hawk'].iloc[-1]:.4f}\n"
-                                f"총 거래 횟수: {self.num_trades}"
-                            )
-                            self.send_to_slack(sell_info)
-                else:
-                    empty_btc_msg = f"매도 신호 무시: BTC 잔고 없음"
-                    logging.info(empty_btc_msg)
-                    self.send_to_slack(f"⚠️ {empty_btc_msg}")
-            
-        except Exception as e:
-            error_msg = f"거래 실행 오류: {str(e)}"
-            logging.error(error_msg)
-            self.send_to_slack(f"❌ {error_msg}")
-    
-    def log_account_info(self):
-        """계좌 정보 로깅"""
-        try:
-            krw_balance = self.upbit.get_balance("KRW")
-            btc_balance = self.upbit.get_balance("BTC")
-            btc_value = btc_balance * pyupbit.get_current_price(TICKER) if btc_balance > 0 else 0
-            total_value = krw_balance + btc_value
-            
-            account_msg = f"계좌 정보 - KRW: {krw_balance:,.2f}, BTC: {btc_balance:.8f} (가치: {btc_value:,.2f} KRW), 총액: {total_value:,.2f} KRW"
-            logging.info(account_msg)
-            
-            # Slack으로 계좌 정보 전송
-            account_info = (
-                f"💰 계좌 정보\n"
-                f"KRW 잔고: {krw_balance:,.2f} KRW\n"
-                f"BTC 보유량: {btc_balance:.8f} BTC\n"
-                f"BTC 가치: {btc_value:,.2f} KRW\n"
-                f"총 자산: {total_value:,.2f} KRW\n"
-                f"포지션: {'매수 중' if self.current_position == 1 else '중립'}\n"
-                f"총 거래 횟수: {self.num_trades}"
-            )
-            self.send_to_slack(account_info)
-            
-        except Exception as e:
-            error_msg = f"계좌 정보 로깅 오류: {str(e)}"
-            logging.error(error_msg)
-            self.send_to_slack(f"❌ {error_msg}")
-    
-    def save_trade_history(self):
-        """거래 기록 저장"""
-        if self.trade_history:
-            try:
-                # 기존 거래 기록 저장
-                with open('ec2_trade_history.json', 'w') as f:
-                    json.dump(self.trade_history, f)
-                
-                logging.info("거래 기록 저장 완료")
-                
-            except Exception as e:
-                error_msg = f"거래 기록 저장 오류: {str(e)}"
-                logging.error(error_msg)
-                self.send_to_slack(f"❌ {error_msg}")
+            logging.error(f"백테스트 지표 계산 중 오류: {str(e)}")
+            return {
+                'profit_factor': 0,
+                'total_trades': 0, 
+                'win_rate': 0,
+                'total_return': 0
+            }
     
     def create_and_share_chart(self):
         """호크스 차트 생성 및 공유"""
@@ -1069,76 +1129,6 @@ class EC2HawkesTrader:
             logging.error(traceback.format_exc())
             return None
             
-    def calculate_backtest_metrics(self):
-        """백테스트 성능 지표 계산"""
-        try:
-            data = self.trading_data.copy()
-            
-            # 백테스트 기간 설정 (최근 500개 데이터)
-            if len(data) > 500:
-                data = data.iloc[-500:]
-                
-            # 수익률 계산
-            data['next_return'] = np.log(data['close']).diff().shift(-1)
-            data['signal_return'] = data['signal'] * data['next_return']
-            
-            # NaN 제거
-            data['signal_return'].fillna(0, inplace=True)
-            
-            # Win/Loss 계산
-            win_returns = data[data['signal_return'] > 0]['signal_return'].sum()
-            lose_returns = data[data['signal_return'] < 0]['signal_return'].abs().sum()
-            
-            # Profit Factor
-            signal_pf = win_returns / lose_returns if lose_returns > 0 else 0
-            
-            # 거래 횟수 계산 (신호 변화 감지)
-            signal_changes = data['signal'].diff().abs()
-            total_trades = signal_changes[signal_changes > 0].count()
-            
-            # 롱 진입/청산 식별
-            signal_to_long = data['signal'].diff() == 1  # 0→1 : 매수 진입
-            signal_to_neutral = data['signal'].diff() == -1  # 1→0 : 매수 청산
-            
-            # 승률 계산
-            long_win_count = 0
-            long_total = 0
-            last_signal = 0
-            entry_price = 0
-            
-            for i in range(1, len(data)):
-                if data['signal'].iloc[i] == 1 and last_signal == 0:  # 매수 진입
-                    entry_price = data['close'].iloc[i]
-                    last_signal = 1
-                elif data['signal'].iloc[i] == 0 and last_signal == 1:  # 매수 청산
-                    exit_price = data['close'].iloc[i]
-                    long_total += 1
-                    if exit_price > entry_price:
-                        long_win_count += 1
-                    last_signal = 0
-            
-            win_rate = (long_win_count / long_total * 100) if long_total > 0 else 0
-            
-            # 누적 수익률
-            data['cumulative_return'] = data['signal_return'].cumsum()
-            total_return = (np.exp(data['cumulative_return'].iloc[-1]) - 1) * 100 if len(data) > 0 else 0
-            
-            # 결과 반환
-            return {
-                'profit_factor': signal_pf,
-                'total_trades': total_trades,
-                'win_rate': win_rate,
-                'total_return': total_return
-            }
-        except Exception as e:
-            logging.error(f"백테스트 지표 계산 중 오류: {str(e)}")
-            return {
-                'profit_factor': 0,
-                'total_trades': 0, 
-                'win_rate': 0,
-                'total_return': 0
-            }
-    
     def run(self):
         """트레이딩 봇 실행"""
         logging.info(f"EC2 Hawkes 트레이딩 봇 시작 (KAPPA: {KAPPA}, LOOKBACK: {VOLATILITY_LOOKBACK})")
